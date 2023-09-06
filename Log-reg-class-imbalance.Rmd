@@ -1,0 +1,248 @@
+---
+title: "Julia Silge - Handling Class Imbalance with TidyModels"
+output:
+---
+
+Source: https://juliasilge.com/blog/himalayan-climbing/
+
+Predict survival of Himalayan expedition members based on characteristics of the person and climbing expedition.
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(knitr)
+members <- read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-09-22/members.csv")
+
+glimpse(members)
+
+members |> View()
+skimr::skim(members)
+```
+
+```{r}
+members |> 
+  # group year into deciles
+  # read as "year floor division 10"
+  group_by(year = 10 * (year %/% 10)) |> 
+  summarise(
+    died = mean(died),
+    success = mean(success)
+  ) |> 
+  pivot_longer(died:success, names_to = "outcome", values_to = "percent") |> 
+  ggplot(aes(year, percent, color = outcome)) +
+  geom_line(alpha = 0.7, linewidth = 1.5) +
+  # format y-axis to be in percent
+  scale_y_continuous(label = scales::percent_format()) +
+  labs(x = NULL, y = "% of expedition members", color = NULL)
+```
+
+```{r}
+members |> 
+  count(success, died) |> 
+  group_by(success) |> 
+  mutate(percent = n / sum(n))
+```
+
+```{r}
+members |> 
+  filter(!is.na(peak_name)) |> 
+  mutate(peak_name = fct_lump(peak_name, prop = 0.05)) |> 
+  count(peak_name, died) |> 
+  group_by(peak_name) |> 
+  mutate(percent = n / sum(n)) |> 
+  arrange(-percent)
+```
+
+```{r}
+members |> 
+  filter(season != "Unknown") |> 
+  count(season, died) |> 
+  group_by(season) |> 
+  mutate(percent = n / sum(n),
+         died = case_when(died ~ "Died", 
+                          TRUE ~ "Died not die")) |> 
+  ggplot(aes(season, percent, fill = season)) +
+  geom_col(show.legend = FALSE, position = "dodge", alpha = 0.8)+
+  facet_wrap(~died, scales = "free") +
+  scale_y_continuous(labels = scales::percent_format())
+```
+
+To train a logistic regression model in tidymodels, the outcome needs to be a factor. It can't be a logical or character.
+```{r}
+members_df <- members |> 
+  filter(season != "Unknown") |> 
+  select(peak_id, year, season, sex, age, citizenship, hired, success, died) |> 
+  filter(!is.na(sex), !is.na(citizenship)) |> 
+  mutate(died = case_when(died ~ "died", 
+                          TRUE ~ "survived")) |> 
+  mutate_if(is.character, factor) |> 
+  mutate_if(is.logical, as.integer)
+```
+
+## Build models
+
+```{r}
+set.seed(123)
+members_split <- initial_split(members_df, strata = died)
+members_train <- training(members_split)
+members_test <- testing(members_split)
+
+set.seed(345)
+members_folds <- vfold_cv(members_train)
+```
+
+Feature engineering and data preprocessing.
+
+Handle class imbalance. Can use step_downsample, step_upsample from the base. Or use step_smote, step_bsmote from themis which uses knn to create new samples.
+
+```{r}
+library(themis)
+# died ~ . means include all other vars as predictors 
+members_rec <- recipe(died ~ ., data = members_train) |> 
+  step_impute_median(age) |> 
+  # pool infrequently occurring values together (citizenship has too many levels)
+  step_other(peak_id, citizenship) |> 
+  # turn all nominal vars into factors
+  # this is necessary for logistic reg
+  # outcome still has to be a factor
+  step_dummy(all_nominal(), -died) |> 
+  # upsample to give same no. surv and died
+  step_smote(died)
+```
+
+Use prep() to make recipe do preprocessing.
+Use bake() to see what the preprocessed data looks like.
+
+Notice instead of peak_id we have it based on location. We don't have autumn because that's the base level. We have male but not female, because female is the base level.
+```{r}
+members_rec |> prep()
+
+members_rec |> prep() |> bake(new_data = NULL)
+
+# verify that step smote upsampled died
+members_rec |> prep() |> bake(new_data = NULL) |> 
+  count(died)
+
+members_wf <- workflow() |> 
+  add_recipe(members_rec)
+
+# here the model is empty
+members_wf
+```
+
+Build a workflow. [35:46] in video.
+
+```{r}
+glm_spec <- logistic_reg() |> 
+  set_engine("glm")
+
+rf_spec <- rand_forest(trees = 1000) |> 
+  set_engine("ranger") |> 
+  set_mode("classification")
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+glm_rs <- members_wf |> 
+  add_model(glm_spec) |> 
+  fit_resamples(
+    resamples = members_folds, 
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity), 
+    control = control_resamples(save_pred = TRUE)
+  )
+
+glm_rs
+```
+
+Here, the data preprocessing recipe is executed on every fold, and then a random forest model is being fit on it and being evaluted on the held out set on each resample. This is repeated for all resamples.
+```{r}
+rf_rs <- members_wf |> 
+  add_model(rf_spec) |> 
+  fit_resamples(
+    resamples = members_folds, 
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity), 
+    control = control_resamples(save_pred = TRUE)
+  )
+
+rf_rs
+```
+
+
+## Evaluate models
+
+Use collect_metrics() to extract metrics from the resampling result tibbles (stored in objects glm_rs and rf_rs).
+
+Use conf_mat_resampled() to look at the confusion matrix. This computes a separate confusion matrix for each resample then averages the cell counts.
+
+Random forest has great accuracy. Logistic regression is way lower. They are much closer in the roc_auc. We can tell what's going on by looking at specificity and sensitivity. In logistic regression they are pretty close, so the model performs similarly for positive and negative cases. The RF model has a very hard time finding the minority case (the people who died).
+
+The glm confusion matrix shows that about 2/3 of people who died were predicted correctly, which is reflected in the sensitivity. It did a little worse on the people who survived. 
+
+The RF confusion matrix shows the model did very poorly on predicting who died. 
+
+```{r}
+collect_metrics(glm_rs)
+collect_metrics(rf_rs)
+
+# look at the confusion matrix
+glm_rs |> 
+  conf_mat_resampled()
+
+rf_rs |> 
+  conf_mat_resampled()
+```
+
+Use collect_predictions() to extract predictions from the resample results.
+
+
+```{r}
+# this gives 10 roc curves
+glm_rs |> 
+  collect_predictions() |> 
+  # group by id to make roc curve
+  group_by(id) |> 
+  roc_curve(died, .pred_died) |> 
+  autoplot()
+```
+
+At this point, the model has been trained on resamples, but has not yet been trained on all the training data.
+
+Use last_fit with members_split as the argument. This fits on the training set and it evaluates on the test set. This is just a convenience function for the last step, which is to fit on training data and evaluate on testing data.
+
+```{r}
+members_final <- members_wf |> 
+  add_model(glm_spec) |> 
+  last_fit(members_split)
+
+# these metrics are on the testing data 
+collect_metrics(members_final)
+
+# this gives predictions on the testing data
+# this is the first time we use the testing data so far
+collect_predictions(members_final) 
+
+collect_predictions(members_final) |> 
+  conf_mat(died, .pred_class)
+```
+
+```{r}
+members_final |> 
+  pull(.workflow) |> 
+  pluck(1) |> 
+  tidy(exponentiate = TRUE) |> 
+  arrange(estimate) |> 
+  kable(digits = 3)
+
+members_final |> 
+  pull(.workflow) |> 
+  pluck(1) |> 
+  tidy() |> 
+  filter(term != "(Intercept)") |> 
+  ggplot(aes(estimate, fct_reorder(term, estimate))) +
+  geom_vline(xintercept = 0, color = "gray50", lty = 2, size = 1.2) +
+  geom_errorbar(aes(xmin = estimate - std.error, xmax = estimate + std.error),
+                width = 0.2, alpha = 0.7) +
+  geom_point()
+```
+
